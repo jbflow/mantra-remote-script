@@ -1,0 +1,203 @@
+import socket
+import hashlib
+import base64
+from threading import Thread
+import json
+import struct
+from .Logging import logger
+from .port_range import start_port, end_port
+
+class Socket(Thread):
+    def __init__(self, c_instance, on_message_callback):
+        Thread.__init__(self)
+        self._c_instance = c_instance
+        self._on_message_callback = on_message_callback
+        self.socket = None
+        self.connection = None
+
+    def run(self):
+        try:
+            self.create_socket(start_port, end_port)
+        except Exception as e:
+            logger.error(f'Error creating socket: {e}')
+
+
+
+    def create_socket(self, start_port, end_port):
+        self.socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        
+        for port in range(start_port, end_port + 1):
+            try:
+                self.socket.bind(('', port))
+                logger.info(f"Server started on port {port}, waiting for connections...")
+                break
+            except socket.error as e:
+                logger.warning(f"Port {port} is unavailable: {e}")
+                if port == end_port:
+                    logger.error("No available ports in the specified range.")
+                    return
+
+        self.socket.listen(1)
+        while True:
+            connection, _ = self.socket.accept()
+            if connection:
+                self.connection = connection
+                logger.info("Client connected")
+                Thread(target=self.handle_connection, args=[connection]).start()
+
+
+    def handle_connection(self, connection):
+        try:
+            if self.perform_handshake(connection):
+                while True:
+                    msg = self.receive_message(connection)
+                    if msg:
+                        logger.info(f'Received message: {msg}')
+                        try:
+                            parsed = json.loads(msg)
+                        except Exception as e:
+                            logger.error(f'Invalid JSON message: {e}')
+                            self.send_json({
+                                "type": "error",
+                                "code": "BAD_REQUEST",
+                                "message": "Invalid JSON"
+                            })
+                            continue
+                        self._on_message_callback(parsed)
+                    else:
+                        break
+        except Exception as e:
+            logger.error(f'Connection error: {e}')
+        finally:
+            connection.close()
+            logger.info('Connection closed')
+
+    def perform_handshake(self, connection):
+        try:
+            logger.info("Performing handshake...")
+            request = connection.recv(1024).decode('utf-8')
+            logger.info(f"Handshake request: {request}")
+
+            headers = self.parse_headers(request)
+            websocket_key = headers['Sec-WebSocket-Key']
+            websocket_accept = self.generate_accept_key(websocket_key)
+
+            response = (
+                'HTTP/1.1 101 Switching Protocols\r\n'
+                'Upgrade: websocket\r\n'
+                'Connection: Upgrade\r\n'
+                f'Sec-WebSocket-Accept: {websocket_accept}\r\n\r\n'
+            )
+
+            connection.send(response.encode('utf-8'))
+            logger.info("Handshake response sent")
+            return True
+        except Exception as e:
+            logger.error(f'Handshake error: {e}')
+            return False
+
+    def parse_headers(self, request):
+        headers = {}
+        lines = request.split('\r\n')
+        for line in lines[1:]:
+            if line:
+                key, value = line.split(': ', 1)
+                headers[key] = value
+        return headers
+
+    def generate_accept_key(self, websocket_key):
+        magic_string = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+        return base64.b64encode(
+            hashlib.sha1((websocket_key + magic_string).encode()).digest()
+        ).decode('utf-8')
+
+    def receive_message(self, connection):
+        try:
+            complete_message = bytearray()
+            while True:
+                data = connection.recv(1024)
+                if not data:
+                    return None
+
+                byte1, byte2 = struct.unpack('BB', data[:2])
+                fin = byte1 & 0b10000000
+                opcode = byte1 & 0b00001111
+                masked = byte2 & 0b10000000
+                payload_length = byte2 & 0b01111111
+
+                if masked != 0b10000000:
+                    logger.info('Client data must be masked')
+                    return None
+
+                if payload_length == 126:
+                    extended_payload_length = data[2:4]
+                    payload_length = int.from_bytes(extended_payload_length, byteorder='big')
+                    masking_key = data[4:8]
+                    payload_data = data[8:]
+                elif payload_length == 127:
+                    extended_payload_length = data[2:10]
+                    payload_length = int.from_bytes(extended_payload_length, byteorder='big')
+                    masking_key = data[10:14]
+                    payload_data = data[14:]
+                else:
+                    masking_key = data[2:6]
+                    payload_data = data[6:]
+
+                decoded_bytes = bytearray()
+                for i in range(payload_length):
+                    decoded_bytes.append(payload_data[i] ^ masking_key[i % 4])
+
+                complete_message.extend(decoded_bytes)
+
+                if fin:
+                    break
+
+            if opcode == 0x1:  # Text frame
+                return complete_message.decode('utf-8')
+            elif opcode == 0x8:  # Connection close frame
+                logger.info('Connection closed by client')
+                return None
+            else:
+                logger.info(f'Unsupported frame type: {opcode}')
+                return None
+        except Exception as e:
+            logger.error(f'Error receiving message: {e}')
+            return None
+
+
+    def send_message(self, message):
+        try:
+            if self.connection and isinstance(message, str):
+                # Create a frame
+                frame = bytearray()
+                fin = 0b10000000  # Final frame
+                frame.append(fin | 0b00000001)  # Text frame opcode
+
+                encoded = message.encode('utf-8')
+                length = len(encoded)
+                if length <= 125:
+                    frame.append(length)
+                elif length <= 65535:
+                    frame.append(126)
+                    frame.extend(struct.pack('!H', length))
+                else:
+                    frame.append(127)
+                    frame.extend(struct.pack('!Q', length))
+
+                # Append the message to the frame
+                frame.extend(encoded)
+
+                # Send the framed message
+                self.connection.sendall(frame)
+            else:
+                logger.info("Connection closed or invalid message")
+        except Exception as e:
+            logger.error(f'Error sending message: {e}')
+
+    def send_json(self, payload):
+        try:
+            self.send_message(json.dumps(payload))
+        except Exception as e:
+            logger.error(f'Error sending JSON message: {e}')
+
