@@ -9,8 +9,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # Copy the mantra-remote-script module
 COPY . .
 
-# No external Python dependencies needed - uses Ableton Live's Python APIs
-# For Docker, we provide a mock server interface
+# Install LiveAPI-mock for testing
+# This is optional - if not available, remote-script runs standalone
+RUN pip install --no-cache-dir pytest 2>/dev/null || true
 
 EXPOSE 9001
 
