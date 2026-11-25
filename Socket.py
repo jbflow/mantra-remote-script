@@ -1,12 +1,23 @@
 import socket
 import hashlib
 import base64
-from threading import Thread
-import zlib
+from threading import Thread, Lock
 import struct
-import ast
-from .Logging import logger
-from .port_range import start_port, end_port
+import json
+
+try:
+    from .Logging import logger
+except ImportError:
+    import logging
+    logger = logging.getLogger("mantra")
+
+try:
+    from .port_range import start_port, end_port
+except ImportError:
+    start_port = 39031
+    end_port = 39038
+
+ALLOWED_ORIGINS = (None, 'localhost', '127.0.0.1')
 
 class Socket(Thread):
     def __init__(self, c_instance, on_message_callback):
@@ -15,14 +26,14 @@ class Socket(Thread):
         self._on_message_callback = on_message_callback
         self.socket = None
         self.connection = None
+        self._send_lock = Lock()
+        self.daemon = True
 
     def run(self):
         try:
             self.create_socket(start_port, end_port)
         except Exception as e:
             logger.error(f'Error creating socket: {e}')
-
-
 
     def create_socket(self, start_port, end_port):
         self.socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -41,28 +52,31 @@ class Socket(Thread):
 
         self.socket.listen(1)
         while True:
-            connection, _ = self.socket.accept()
-            if connection:
-                self.connection = connection
-                logger.info("Client connected")
-                Thread(target=self.handle_connection, args=[connection]).start()
-
+            try:
+                connection, _ = self.socket.accept()
+                if connection:
+                    logger.info("Client connected")
+                    self.connection = connection
+                    Thread(target=self.handle_connection, args=[connection]).start()
+            except Exception as e:
+                logger.error(f'Error accepting connection: {e}')
 
     def handle_connection(self, connection):
         try:
             if self.perform_handshake(connection):
                 while True:
                     msg = self.receive_message(connection)
-                    if msg:
-                        logger.info(f'Received message: {msg}')
-                        self._on_message_callback(ast.literal_eval(msg))
-                    else:
+                    if msg is None:
                         break
+                    if msg == 'ping':
+                        self.send_message(json.dumps({'type': 'pong'}))
+                    else:
+                        logger.info(f'Received message: {msg}')
+                        self._on_message_callback(msg)
         except Exception as e:
             logger.error(f'Connection error: {e}')
         finally:
-            connection.close()
-            logger.info('Connection closed')
+            self.disconnect()
 
     def perform_handshake(self, connection):
         try:
@@ -71,7 +85,18 @@ class Socket(Thread):
             logger.info(f"Handshake request: {request}")
 
             headers = self.parse_headers(request)
-            websocket_key = headers['Sec-WebSocket-Key']
+            origin = headers.get('Origin')
+            if origin:
+                origin_host = origin.replace('http://', '').replace('https://', '').split(':')[0]
+                if origin_host not in ALLOWED_ORIGINS:
+                    logger.warning(f"Origin not allowed: {origin}")
+                    return False
+
+            websocket_key = headers.get('Sec-WebSocket-Key')
+            if not websocket_key:
+                logger.error('Missing Sec-WebSocket-Key')
+                return False
+
             websocket_accept = self.generate_accept_key(websocket_key)
 
             response = (
@@ -93,8 +118,11 @@ class Socket(Thread):
         lines = request.split('\r\n')
         for line in lines[1:]:
             if line:
-                key, value = line.split(': ', 1)
-                headers[key] = value
+                try:
+                    key, value = line.split(': ', 1)
+                    headers[key] = value
+                except ValueError:
+                    pass
         return headers
 
     def generate_accept_key(self, websocket_key):
@@ -107,11 +135,11 @@ class Socket(Thread):
         try:
             complete_message = bytearray()
             while True:
-                data = connection.recv(1024)
-                if not data:
+                frame_header = connection.recv(2)
+                if len(frame_header) < 2:
                     return None
 
-                byte1, byte2 = struct.unpack('BB', data[:2])
+                byte1, byte2 = struct.unpack('BB', frame_header)
                 fin = byte1 & 0b10000000
                 opcode = byte1 & 0b00001111
                 masked = byte2 & 0b10000000
@@ -122,21 +150,24 @@ class Socket(Thread):
                     return None
 
                 if payload_length == 126:
-                    extended_payload_length = data[2:4]
+                    extended_payload_length = connection.recv(2)
                     payload_length = int.from_bytes(extended_payload_length, byteorder='big')
-                    masking_key = data[4:8]
-                    payload_data = data[8:]
                 elif payload_length == 127:
-                    extended_payload_length = data[2:10]
+                    extended_payload_length = connection.recv(8)
                     payload_length = int.from_bytes(extended_payload_length, byteorder='big')
-                    masking_key = data[10:14]
-                    payload_data = data[14:]
-                else:
-                    masking_key = data[2:6]
-                    payload_data = data[6:]
+
+                masking_key = connection.recv(4)
+                payload_data = bytearray()
+                remaining = payload_length
+                while remaining > 0:
+                    chunk = connection.recv(min(remaining, 1024))
+                    if not chunk:
+                        return None
+                    payload_data.extend(chunk)
+                    remaining -= len(chunk)
 
                 decoded_bytes = bytearray()
-                for i in range(payload_length):
+                for i in range(len(payload_data)):
                     decoded_bytes.append(payload_data[i] ^ masking_key[i % 4])
 
                 complete_message.extend(decoded_bytes)
@@ -144,11 +175,14 @@ class Socket(Thread):
                 if fin:
                     break
 
-            if opcode == 0x1:  # Text frame
+            if opcode == 0x1:
                 return complete_message.decode('utf-8')
-            elif opcode == 0x8:  # Connection close frame
+            elif opcode == 0x8:
                 logger.info('Connection closed by client')
                 return None
+            elif opcode == 0x9:
+                self.send_message(json.dumps({'type': 'pong'}))
+                return self.receive_message(connection)
             else:
                 logger.info(f'Unsupported frame type: {opcode}')
                 return None
@@ -156,35 +190,42 @@ class Socket(Thread):
             logger.error(f'Error receiving message: {e}')
             return None
 
-
     def send_message(self, message):
-        try:
-            if self.connection and isinstance(message, str):
-                # Compress the message using zlib
-                compressed_message = zlib.compress(message.encode('utf-8'))
+        with self._send_lock:
+            try:
+                if self.connection and isinstance(message, str):
+                    msg_bytes = message.encode('utf-8')
+                    frame = bytearray()
+                    fin = 0b10000000
+                    frame.append(fin | 0x1)
 
-                # Create a frame
-                frame = bytearray()
-                fin = 0b10000000  # Final frame
-                frame.append(fin | 0b00000010)  # Binary frame opcode
+                    length = len(msg_bytes)
+                    if length <= 125:
+                        frame.append(length)
+                    elif length <= 65535:
+                        frame.append(126)
+                        frame.extend(struct.pack('!H', length))
+                    else:
+                        frame.append(127)
+                        frame.extend(struct.pack('!Q', length))
 
-                length = len(compressed_message)
-                if length <= 125:
-                    frame.append(length)
-                elif length <= 65535:
-                    frame.append(126)
-                    frame.extend(struct.pack('!H', length))
+                    frame.extend(msg_bytes)
+                    self.connection.sendall(bytes(frame))
                 else:
-                    frame.append(127)
-                    frame.extend(struct.pack('!Q', length))
+                    logger.info("Connection closed or invalid message")
+            except Exception as e:
+                logger.error(f'Error sending message: {e}')
 
-                # Append the compressed message to the frame
-                frame.extend(compressed_message)
-
-                # Send the framed message
-                self.connection.sendall(frame)
-            else:
-                logger.info("Connection closed or invalid message")
+    def disconnect(self):
+        try:
+            if self.connection:
+                self.connection.close()
+                self.connection = None
         except Exception as e:
-            logger.error(f'Error sending message: {e}')
-
+            logger.error(f'Error closing connection: {e}')
+        try:
+            if self.socket:
+                self.socket.close()
+                self.socket = None
+        except Exception as e:
+            logger.error(f'Error closing socket: {e}')
