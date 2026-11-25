@@ -5,7 +5,7 @@ from _Framework.ControlSurface import ControlSurface
 from ableton.v3.base import nop
 from .Socket import Socket
 from .Protocol import Protocol
-from .Handlers import Interpreter
+from . import handlers
 from .Logging import logger
 
 class Mantra(ControlSurface):
@@ -13,8 +13,7 @@ class Mantra(ControlSurface):
         super(Mantra, self).__init__(c_instance, *a, **k)
         self._c_instance = c_instance
         with self.component_guard():
-            self.interpreter = Interpreter(self.song, self.application)
-            self.protocol = Protocol(self.interpreter)
+            self.protocol = Protocol(self)
             self.socket = Socket(c_instance, self.socket_callback)
             self.socket.start()
             self.message_queue = queue.Queue()
@@ -26,6 +25,9 @@ class Mantra(ControlSurface):
         self.check_queue.stop()
         self.socket.disconnect()
         super(Mantra, self).disconnect()
+
+    def execute_batch(self, envelopes):
+        return handlers.execute_batch(envelopes, self.song(), self.application())
 
     def socket_callback(self, msg_text):
         logger.info(f'Socket callback invoked with: {msg_text}')
