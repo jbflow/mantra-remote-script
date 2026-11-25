@@ -2,8 +2,9 @@ import socket
 import hashlib
 import base64
 from threading import Thread
-import json
+import zlib
 import struct
+import ast
 from .Logging import logger
 from .port_range import start_port, end_port
 
@@ -54,17 +55,7 @@ class Socket(Thread):
                     msg = self.receive_message(connection)
                     if msg:
                         logger.info(f'Received message: {msg}')
-                        try:
-                            parsed = json.loads(msg)
-                        except Exception as e:
-                            logger.error(f'Invalid JSON message: {e}')
-                            self.send_json({
-                                "type": "error",
-                                "code": "BAD_REQUEST",
-                                "message": "Invalid JSON"
-                            })
-                            continue
-                        self._on_message_callback(parsed)
+                        self._on_message_callback(ast.literal_eval(msg))
                     else:
                         break
         except Exception as e:
@@ -169,13 +160,15 @@ class Socket(Thread):
     def send_message(self, message):
         try:
             if self.connection and isinstance(message, str):
+                # Compress the message using zlib
+                compressed_message = zlib.compress(message.encode('utf-8'))
+
                 # Create a frame
                 frame = bytearray()
                 fin = 0b10000000  # Final frame
-                frame.append(fin | 0b00000001)  # Text frame opcode
+                frame.append(fin | 0b00000010)  # Binary frame opcode
 
-                encoded = message.encode('utf-8')
-                length = len(encoded)
+                length = len(compressed_message)
                 if length <= 125:
                     frame.append(length)
                 elif length <= 65535:
@@ -185,8 +178,8 @@ class Socket(Thread):
                     frame.append(127)
                     frame.extend(struct.pack('!Q', length))
 
-                # Append the message to the frame
-                frame.extend(encoded)
+                # Append the compressed message to the frame
+                frame.extend(compressed_message)
 
                 # Send the framed message
                 self.connection.sendall(frame)
@@ -194,10 +187,4 @@ class Socket(Thread):
                 logger.info("Connection closed or invalid message")
         except Exception as e:
             logger.error(f'Error sending message: {e}')
-
-    def send_json(self, payload):
-        try:
-            self.send_message(json.dumps(payload))
-        except Exception as e:
-            logger.error(f'Error sending JSON message: {e}')
 
