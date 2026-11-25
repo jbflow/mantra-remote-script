@@ -5,25 +5,15 @@ from _Framework.ControlSurface import ControlSurface
 from ableton.v3.base import nop
 from .Socket import Socket
 from .Protocol import Protocol
+from .Handlers import Interpreter
 from .Logging import logger
-
-class PlaceholderInterpreter:
-    def execute_batch(self, envelopes):
-        results = []
-        for env in envelopes:
-            results.append({
-                'id': env.get('id'),
-                'status': 'error',
-                'details': {'message': 'unsupported'}
-            })
-        return results
 
 class Mantra(ControlSurface):
     def __init__(self, c_instance, *a, **k):
         super(Mantra, self).__init__(c_instance, *a, **k)
         self._c_instance = c_instance
         with self.component_guard():
-            self.interpreter = PlaceholderInterpreter()
+            self.interpreter = Interpreter(self.song, self.application)
             self.protocol = Protocol(self.interpreter)
             self.socket = Socket(c_instance, self.socket_callback)
             self.socket.start()
